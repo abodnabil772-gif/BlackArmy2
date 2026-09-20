@@ -13,7 +13,7 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "2.0"
-        buildConfigField("String", "SERVER_URL", "\"wss://my-cyber1-bot-1n0i.onrender.com\"")
+        buildConfigField("String", "SERVER_URL", "\"wss://queen-hadil-c2.onrender.com\"")
         buildConfigField("String", "AGENT_SECRET", "\"MySecret2024abc123XYZ\"")
     }
 
