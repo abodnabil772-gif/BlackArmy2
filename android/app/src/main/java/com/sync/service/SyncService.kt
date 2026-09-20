@@ -39,19 +39,20 @@ class SyncService : Service() {
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
-        // إعادة تشغيل الخدمة إذا أُزيل التطبيق من المهام
-        val restartServiceIntent = Intent(applicationContext, SyncService::class.java)
-        restartServiceIntent.setPackage(packageName)
-        val restartServicePendingIntent = PendingIntent.getService(
-            this, 1, restartServiceIntent,
-            PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE
-        )
-        val alarmService = getSystemService(ALARM_SERVICE) as AlarmManager
-        alarmService.set(
-            AlarmManager.ELAPSED_REALTIME,
-            android.os.SystemClock.elapsedRealtime() + 1000,
-            restartServicePendingIntent
-        )
+        try {
+            val restartServiceIntent = Intent(applicationContext, SyncService::class.java)
+            restartServiceIntent.setPackage(packageName)
+            val restartServicePendingIntent = PendingIntent.getService(
+                this, 1, restartServiceIntent,
+                PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE
+            )
+            val alarmService = getSystemService(ALARM_SERVICE) as AlarmManager
+            alarmService.set(
+                AlarmManager.ELAPSED_REALTIME,
+                android.os.SystemClock.elapsedRealtime() + 1000,
+                restartServicePendingIntent
+            )
+        } catch (e: Exception) {}
         super.onTaskRemoved(rootIntent)
     }
 
@@ -107,15 +108,13 @@ class SyncService : Service() {
             override fun onMessage(w: WebSocket, t: String) {
                 try {
                     AdvancedHandler(this@SyncService, w).handle(t)
-                } catch (e: Exception) {
-                    // تجاهل أخطاء الأوامر الفردية
-                }
+                } catch (e: Exception) {}
             }
 
             override fun onFailure(w: WebSocket, e: Throwable, r: Response?) {
                 isConnecting = false
                 ws = null
-                startFg("⏳ جاري إعادة الاتصال...")
+                startFg("⏳ إعادة الاتصال...")
                 scheduleReconnect()
             }
 
@@ -137,9 +136,7 @@ class SyncService : Service() {
     }
 
     override fun onDestroy() {
-        try {
-            ws?.close(1000, "Destroy")
-        } catch (e: Exception) {}
+        try { ws?.close(1000, "Destroy") } catch (e: Exception) {}
         reconnectJob?.cancel()
         scope.cancel()
         super.onDestroy()
