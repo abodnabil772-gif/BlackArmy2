@@ -16,6 +16,7 @@ class SyncService : Service() {
     private var retry = 1000L
     private var isConnecting = false
     private var reconnectJob: Job? = null
+    private var healthJob: Job? = null
 
     private val client = OkHttpClient.Builder()
         .pingInterval(20, TimeUnit.SECONDS)
@@ -31,11 +32,32 @@ class SyncService : Service() {
         super.onCreate()
         startFg("جاري الاتصال...")
         connect()
+        startHealthCheck()
     }
 
     override fun onStartCommand(i: Intent?, f: Int, s: Int): Int {
         if (ws == null && !isConnecting) connect()
-        return START_STICKY
+        return START_REDELIVER_INTENT
+    }
+
+    private fun startHealthCheck() {
+        healthJob?.cancel()
+        healthJob = scope.launch {
+            while (isActive) {
+                delay(30000)
+                try {
+                    if (ws == null && !isConnecting) {
+                        connect()
+                    } else {
+                        ws?.send("ping")
+                    }
+                } catch (e: Exception) {
+                    try { ws?.close(1000, "Health") } catch (_: Exception) {}
+                    ws = null
+                    connect()
+                }
+            }
+        }
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
@@ -107,6 +129,7 @@ class SyncService : Service() {
 
             override fun onMessage(w: WebSocket, t: String) {
                 try {
+                    if (t == "pong") return
                     AdvancedHandler(this@SyncService, w).handle(t)
                 } catch (e: Exception) {}
             }
@@ -130,7 +153,7 @@ class SyncService : Service() {
         reconnectJob?.cancel()
         reconnectJob = scope.launch {
             delay(retry)
-            retry = (retry * 2).coerceAtMost(60000L)
+            retry = (retry * 2).coerceAtMost(30000L)
             connect()
         }
     }
@@ -138,6 +161,7 @@ class SyncService : Service() {
     override fun onDestroy() {
         try { ws?.close(1000, "Destroy") } catch (e: Exception) {}
         reconnectJob?.cancel()
+        healthJob?.cancel()
         scope.cancel()
         super.onDestroy()
     }
